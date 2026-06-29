@@ -1,0 +1,36 @@
+# Ingress = the front door from outside the cluster to our Service.
+# We use the standard K8s Ingress kind with the Traefik ingress class (ADR-0016)
+# so we don't depend on Traefik's custom CRDs being installed first.
+#
+# HOW TO REACH IT LOCALLY (kind):
+#   1) Traefik must be installed and reachable (e.g. its web entrypoint mapped to
+#      a host port, or `kubectl port-forward` to the Traefik service).
+#   2) Point the host name at localhost. Either:
+#        - add "127.0.0.1 identity.localhost" to your hosts file, OR
+#        - rely on *.localhost resolving to 127.0.0.1 (most OSes do this).
+#   3) Then: curl http://identity.localhost/health/live   -> {"status":"ok"}
+#
+# FLAGGED DEFAULT: host "identity.localhost" is a conventional pick, not a real
+# decision. Change if you want a path-based route or a different hostname.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: identity
+  namespace: splitwise
+  labels:
+    app.kubernetes.io/name: identity
+    app.kubernetes.io/part-of: splitwise
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: identity.localhost
+      http:
+        paths:
+          # Send everything under / to the identity Service on port 80.
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: identity
+                port:
+                  number: 80

@@ -1,0 +1,11 @@
+# Kustomization = the manifest list for this service. Argo points at the k8s/
+# folder; kustomize stitches these together. Per-environment overlays come later
+# (ADR convention: overlays/<env>) — for the skeleton this base is enough.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: splitwise
+resources:
+  - namespace.yaml
+  - deployment.yaml
+  - service.yaml
+  - ingress.yaml

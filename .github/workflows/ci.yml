@@ -1,0 +1,88 @@
+# CI for the identity service (ADR-0014).
+# Caveman flow: install -> build -> test -> (only on main) build image, tag with
+# git SHA + latest, push to GHCR.
+name: ci
+
+# Run on every push to main and on every PR. PRs build/test but do NOT push.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Least privilege: read the repo, and write packages (GHCR) when we push.
+permissions:
+  contents: read
+  packages: write
+
+# Where the image lives (ADR-0013). Lowercase required by GHCR.
+env:
+  IMAGE: ghcr.io/kopparamphani/identity
+
+jobs:
+  # ---- Build + test the Node app ----
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      # npm ci = clean, reproducible install from the lockfile.
+      - name: Install
+        run: npm ci
+
+      # Compile TS -> JS. Fails the build if the code doesn't compile.
+      - name: Build
+        run: npm run build
+
+      # e2e/jest tests. Skeleton: hits the health endpoints.
+      - name: Test
+        run: npm test
+
+  # ---- Build the image and push to GHCR. Only on main, after tests pass. ----
+  image:
+    needs: build-test
+    runs-on: ubuntu-latest
+    # Guard: never push images from PRs (fork PRs lack a write token anyway).
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Buildx gives us a modern builder with layer caching.
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Log in to GHCR using the built-in token. No secrets to manage.
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Build once, tag twice:
+      #   - <git SHA> = immutable, what Argo should deploy.
+      #   - latest    = moving pointer for convenience / local pulls.
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:${{ github.sha }}
+            ${{ env.IMAGE }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Reminder for humans: after this runs, bump the SHA tag in identity's
+      # k8s/deployment.yaml so Argo deploys this exact build (not :latest).
+      - name: Next step reminder
+        run: |
+          echo "Pushed ${{ env.IMAGE }}:${{ github.sha }}"
+          echo "Now set that SHA tag in k8s/deployment.yaml so Argo deploys it."

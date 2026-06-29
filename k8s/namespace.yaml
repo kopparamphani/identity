@@ -1,0 +1,9 @@
+# Namespace = a labeled room in the cluster. Keeps all Splitwise stuff together.
+# Argo also creates this via CreateNamespace=true, but we keep it here so the
+# manifests are self-contained and work with a plain `kubectl apply -f k8s/`.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: splitwise
+  labels:
+    app.kubernetes.io/part-of: splitwise

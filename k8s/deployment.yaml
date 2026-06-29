@@ -1,0 +1,78 @@
+# Deployment = "keep N copies of this container running". K8s restarts crashes,
+# rolls out new versions, and points the probes at our health endpoints.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: identity
+  namespace: splitwise
+  labels:
+    app.kubernetes.io/name: identity
+    app.kubernetes.io/part-of: splitwise
+spec:
+  # One copy for the walking skeleton. Bump later when we need HA.
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: identity
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: identity
+        app.kubernetes.io/part-of: splitwise
+    spec:
+      # Pod-level security: never run as root. Belt-and-suspenders with the
+      # Dockerfile's USER node (UID 1000).
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+        - name: identity
+          # IMAGE TAG CONVENTION (ADR-0013):
+          #   - CI pushes BOTH the immutable git SHA tag and a moving `latest`.
+          #   - Argo must deploy the SHA, not `latest`, for reproducible state.
+          #   - This `:latest` is a PLACEHOLDER. The real SHA tag is bumped HERE
+          #     by CI (or by hand) per our convention. Like: pin the exact build.
+          image: ghcr.io/kopparamphani/identity:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 3000
+          env:
+            # App reads PORT from env; keep it explicit so probes/Service agree.
+            - name: PORT
+              value: "3000"
+          # Liveness = "is it alive?". Fail -> K8s restarts the pod.
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: 3000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          # Readiness = "ready for traffic?". Fail -> pulled out of the Service.
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 3000
+            initialDelaySeconds: 3
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          # Resource asks. FLAGGED DEFAULT: conventional small values for a
+          # Node skeleton. Tune once we have real load numbers.
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+          # Container hardening: no privilege escalation, read-only root FS.
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL

@@ -1,0 +1,19 @@
+# Service = a stable in-cluster address + load balancer for the pods.
+# Other services and the ingress talk to "identity" on port 80; it forwards
+# to the container's port 3000.
+apiVersion: v1
+kind: Service
+metadata:
+  name: identity
+  namespace: splitwise
+  labels:
+    app.kubernetes.io/name: identity
+    app.kubernetes.io/part-of: splitwise
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: identity
+  ports:
+    - name: http
+      port: 80
+      targetPort: 3000

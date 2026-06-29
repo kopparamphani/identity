@@ -1,0 +1,13 @@
+# Keep the build context small and avoid leaking local junk into the image.
+node_modules
+dist
+npm-debug.log*
+.git
+.gitignore
+.env
+.env.*
+README.md
+Dockerfile
+.dockerignore
+coverage
+*.tsbuildinfo
