@@ -61,7 +61,7 @@ spec:
           # Dedicated migrate image (Dockerfile `migrate` target): carries
           # drizzle-kit + the SQL files the slim runtime image drops.
           # SHA TAG (ADR-0013): CI bumps this here, same as the app image.
-          image: ghcr.io/kopparamphani/identity-migrate:52d08ad0eccf4d8c009d83e08e36cecce6b552ec
+          image: ghcr.io/kopparamphani/identity-migrate:a34ac8d4f6f54b32958a4fa26350f28a6d3b8c83
           imagePullPolicy: IfNotPresent
           command: ["npm", "run", "db:migrate"]
           # Only needs the DB URL. drizzle.config.ts reads DATABASE_URL.

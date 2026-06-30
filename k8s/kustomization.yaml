@@ -19,6 +19,6 @@ resources:
 # Argo deploys the exact build, not a moving :latest. Both images move together.
 images:
   - name: ghcr.io/kopparamphani/identity
-    newTag: 52d08ad0eccf4d8c009d83e08e36cecce6b552ec
+    newTag: a34ac8d4f6f54b32958a4fa26350f28a6d3b8c83
   - name: ghcr.io/kopparamphani/identity-migrate
-    newTag: 52d08ad0eccf4d8c009d83e08e36cecce6b552ec
+    newTag: a34ac8d4f6f54b32958a4fa26350f28a6d3b8c83
