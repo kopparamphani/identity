@@ -1,0 +1,119 @@
+# Identity's OWN Postgres (database-per-service, ADR-0006/0002).
+# Nobody else touches this DB. Lives in the same namespace, named clearly so
+# it's obvious which service owns it. Like: each service gets its own filing
+# cabinet, not a shared drawer.
+
+---
+# Headless Service = stable DNS for the StatefulSet pod: identity-db.
+# clusterIP: None means "give each pod a DNS record" (StatefulSet pattern).
+apiVersion: v1
+kind: Service
+metadata:
+  name: identity-db
+  namespace: splitwise
+  labels:
+    app.kubernetes.io/name: identity-db
+    app.kubernetes.io/part-of: splitwise
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: identity-db
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432
+
+---
+# StatefulSet = pod with a stable name + its own persistent disk.
+# Right shape for a database: keeps the same identity and storage across restarts.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: identity-db
+  namespace: splitwise
+  labels:
+    app.kubernetes.io/name: identity-db
+    app.kubernetes.io/part-of: splitwise
+spec:
+  serviceName: identity-db
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: identity-db
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: identity-db
+        app.kubernetes.io/part-of: splitwise
+    spec:
+      # postgres image runs as uid 999; let it own its data dir.
+      securityContext:
+        fsGroup: 999
+      containers:
+        - name: postgres
+          # Postgres 16 (locked minor for reproducibility). IfNotPresent so the
+          # Zscaler-blocked pull is skipped once we kind-load the image.
+          image: postgres:16.4
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: postgres
+              containerPort: 5432
+          # User/password/db come from the same Secret the app uses — one source
+          # of truth. PGDATA in a subdir so the volume root stays clean.
+          env:
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: identity-secrets
+                  key: POSTGRES_USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: identity-secrets
+                  key: POSTGRES_PASSWORD
+            - name: POSTGRES_DB
+              valueFrom:
+                secretKeyRef:
+                  name: identity-secrets
+                  key: POSTGRES_DB
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          # Readiness = "can it take queries?". pg_isready checks the socket.
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\""]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
+          # Liveness = "is the engine alive?".
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U \"$POSTGRES_USER\""]
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+          # Small asks for a local skeleton DB. Tune with real load later.
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+  # PVC template = the database's own disk. kind uses local-path provisioner.
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          app.kubernetes.io/name: identity-db
+          app.kubernetes.io/part-of: splitwise
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi

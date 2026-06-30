@@ -6,6 +6,19 @@ kind: Kustomization
 namespace: splitwise
 resources:
   - namespace.yaml
+  # Identity's own Postgres (db-per-service) + its migration Job (Argo PreSync).
+  - postgres.yaml
+  - migrate-job.yaml
   - deployment.yaml
   - service.yaml
   - ingress.yaml
+# NOTE: secret.example.yaml is intentionally NOT listed — it is a template only.
+# The real identity-secrets Secret is created out of band (kind) or sealed (prod).
+
+# IMAGE TAG CONVENTION (ADR-0013): CI bumps these to the immutable git SHA so
+# Argo deploys the exact build, not a moving :latest. Both images move together.
+images:
+  - name: ghcr.io/kopparamphani/identity
+    newTag: latest
+  - name: ghcr.io/kopparamphani/identity-migrate
+    newTag: latest

@@ -1,0 +1,30 @@
+// Bundled fallback list of top-breached passwords (ADR-0025).
+// Used when HIBP is unreachable so dev/offline still blocks the worst ones.
+// Small on purpose — the live HIBP check is the real defense.
+export const BREACHED_FALLBACK = new Set<string>([
+  '123456',
+  '123456789',
+  'qwerty',
+  'password',
+  '12345678',
+  '111111',
+  '12345',
+  'colombia',
+  '123123',
+  '1234567',
+  '1234567890',
+  '000000',
+  'abc123',
+  'iloveyou',
+  'password1',
+  'qwerty123',
+  'admin',
+  'welcome',
+  'monkey',
+  'letmein',
+  'dragon',
+  'football',
+  'princess',
+  'sunshine',
+  'qwertyuiop',
+]);

@@ -1,0 +1,80 @@
+# Migration Job — runs drizzle-kit migrate BEFORE the app serves traffic.
+#
+# Argo PreSync hook: Argo runs this Job and waits for it to succeed before
+# syncing the rest (Deployment etc.). So the schema is always in place before
+# the app pods come up. Like: lay the pipes before you turn on the tap.
+#
+# Idempotent: drizzle-kit records applied migrations in a journal table and only
+# runs new ones, so re-running on every sync is safe.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: identity-db-migrate
+  namespace: splitwise
+  labels:
+    app.kubernetes.io/name: identity
+    app.kubernetes.io/part-of: splitwise
+  annotations:
+    # Argo: run this in the PreSync phase and wait for success.
+    argocd.argoproj.io/hook: PreSync
+    # Replace the previous hook Job on each sync (don't pile up old Jobs).
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  # Give up after a few tries; don't loop forever on a real schema error.
+  backoffLimit: 3
+  # Clean finished Job objects after 5 min so the namespace stays tidy.
+  ttlSecondsAfterFinished: 300
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: identity
+        app.kubernetes.io/part-of: splitwise
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      # initContainer waits for Postgres to accept connections so migrate doesn't
+      # race the DB on a cold start. Like: knock before you walk in.
+      initContainers:
+        - name: wait-for-db
+          image: postgres:16.4
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - |
+              echo "waiting for identity-db..."
+              until pg_isready -h identity-db -p 5432 -U "$PGUSER"; do
+                sleep 2
+              done
+              echo "db is ready"
+          env:
+            - name: PGUSER
+              valueFrom:
+                secretKeyRef:
+                  name: identity-secrets
+                  key: POSTGRES_USER
+      containers:
+        - name: migrate
+          # Dedicated migrate image (Dockerfile `migrate` target): carries
+          # drizzle-kit + the SQL files the slim runtime image drops.
+          # SHA TAG (ADR-0013): CI bumps this here, same as the app image.
+          image: ghcr.io/kopparamphani/identity-migrate:latest
+          imagePullPolicy: IfNotPresent
+          command: ["npm", "run", "db:migrate"]
+          # Only needs the DB URL. drizzle.config.ts reads DATABASE_URL.
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: identity-secrets
+                  key: DATABASE_URL
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
