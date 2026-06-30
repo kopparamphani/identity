@@ -59,7 +59,7 @@ spec:
           #   - Argo must deploy the SHA, not `latest`, for reproducible state.
           #   - This `:latest` is a PLACEHOLDER. The real SHA tag is bumped HERE
           #     by CI (or by hand) per our convention. Like: pin the exact build.
-          image: ghcr.io/kopparamphani/identity:latest
+          image: ghcr.io/kopparamphani/identity:52d08ad0eccf4d8c009d83e08e36cecce6b552ec
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
