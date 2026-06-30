@@ -26,6 +26,32 @@ spec:
         runAsNonRoot: true
         runAsUser: 1000
         fsGroup: 1000
+      # Wait for Postgres before the app boots. The Argo PreSync migrate Job
+      # also runs first, but this covers plain `kubectl apply -k` (no hooks) and
+      # pod restarts. Like: don't open the shop till the lights are on.
+      initContainers:
+        - name: wait-for-db
+          image: postgres:16.4
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - |
+              until pg_isready -h identity-db -p 5432 -U "$PGUSER"; do
+                echo "waiting for identity-db..."; sleep 2
+              done
+          env:
+            - name: PGUSER
+              valueFrom:
+                secretKeyRef:
+                  name: identity-secrets
+                  key: POSTGRES_USER
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
       containers:
         - name: identity
           # IMAGE TAG CONVENTION (ADR-0013):
@@ -42,6 +68,22 @@ spec:
             # App reads PORT from env; keep it explicit so probes/Service agree.
             - name: PORT
               value: "3000"
+            # production = Secure cookie flag on (auth.controller.ts).
+            - name: NODE_ENV
+              value: "production"
+            # Secrets (ADR-0018). DATABASE_URL -> postgres-js; JWT_SECRET -> tokens.
+            # Pulled from the identity-secrets Secret (created out of band locally,
+            # Sealed Secret in prod). Fail-loud: db.module getOrThrow if missing.
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: identity-secrets
+                  key: DATABASE_URL
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: identity-secrets
+                  key: JWT_SECRET
           # Liveness = "is it alive?". Fail -> K8s restarts the pod.
           livenessProbe:
             httpGet:
