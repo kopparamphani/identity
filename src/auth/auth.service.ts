@@ -2,6 +2,7 @@ import {
   ConflictException,
   Inject,
   Injectable,
+  Logger,
   OnModuleInit,
   UnauthorizedException,
   UnprocessableEntityException,
@@ -13,6 +14,10 @@ import { createHash, randomBytes } from 'crypto';
 import { DRIZZLE, DrizzleDB } from '../db/db.module';
 import { account, session } from '../db/schema';
 import { PasswordService } from './password.service';
+import {
+  GoogleIdentity,
+  GoogleVerifierService,
+} from './google-verifier.service';
 
 // LOCKED policy (data model + ADR-0024): 5 bad tries -> 15 min lockout.
 const MAX_FAILED_ATTEMPTS = 5;
@@ -24,6 +29,11 @@ const REFRESH_TTL_DAYS = 30;
 
 // Entropy of the opaque refresh token. 32 random bytes -> ~256 bits, base64url.
 const REFRESH_TOKEN_BYTES = 32;
+
+// Postgres unique-violation SQLSTATE. Thrown when two concurrent first-time
+// Google sign-ins both try to insert the same email/sub. We catch this to turn
+// a lost insert race into a clean retry-as-login instead of a 500.
+const PG_UNIQUE_VIOLATION = '23505';
 
 // What the controller needs to answer: the JWT body + the opaque refresh token.
 export interface IssuedTokens {
@@ -38,8 +48,19 @@ export interface IssuedTokens {
 // Thrown when a locked account tries to log in -> controller maps to 429.
 export class AccountLockedException extends Error {}
 
+// Google result = the usual tokens + whether we minted a brand-new account.
+// created -> 201, existing -> 200 (controller picks the status from this flag).
+export interface GoogleAuthResult {
+  tokens: IssuedTokens;
+  created: boolean;
+}
+
 @Injectable()
 export class AuthService implements OnModuleInit {
+  // Audit logger. Identity changes (e.g. Google link) get a deliberate INFO
+  // line here. TODO: replace with a real audit-table row once that table exists.
+  private readonly logger = new Logger(AuthService.name);
+
   // Fixed dummy Argon2id hash, computed once at startup. Used on the
   // missing-account / null-hash login path so that branch costs ~the same
   // CPU as a real verify -> no timing oracle for user enumeration.
@@ -50,6 +71,7 @@ export class AuthService implements OnModuleInit {
     private readonly passwords: PasswordService,
     private readonly jwt: JwtService,
     private readonly config: ConfigService,
+    private readonly googleVerifier: GoogleVerifierService,
   ) {}
 
   // Precompute the dummy hash once when the module boots, not per-request.
@@ -87,15 +109,26 @@ export class AuthService implements OnModuleInit {
 
     const passwordHash = await this.passwords.hash(password);
 
-    const [created] = await this.db
-      .insert(account)
-      .values({
-        email: normalizedEmail,
-        displayName,
-        passwordHash,
-        authProvider: 'local',
-      })
-      .returning({ id: account.accountId });
+    let created;
+    try {
+      [created] = await this.db
+        .insert(account)
+        .values({
+          email: normalizedEmail,
+          displayName,
+          passwordHash,
+          authProvider: 'local',
+        })
+        .returning({ id: account.accountId });
+    } catch (err) {
+      // Race: another signup with the same email slipped in between our check
+      // and this insert. The unique constraint catches it -> map to the SAME
+      // 409 the pre-check gives, never a 500.
+      if (this.isUniqueViolation(err)) {
+        throw new ConflictException('Email already used');
+      }
+      throw err;
+    }
 
     // Auto-login: brand-new account gets a session right away.
     return this.issueTokens(created.id);
@@ -138,6 +171,131 @@ export class AuthService implements OnModuleInit {
       .where(eq(account.accountId, found.accountId));
 
     return this.issueTokens(found.accountId);
+  }
+
+  // GOOGLE SIGN-IN (REQ-ACC-01/02 Google paths). Single endpoint handles BOTH
+  // sign up and login: we verify the ID token, then resolve to an account by
+  // three rules, then issue the SAME tokens as 1a (reuses issueTokens).
+  //   1. Known google_subject_id        -> log in (existing, 200).
+  //   2. Same email, local-only account -> LINK (set sub + auth_provider=both),
+  //      then log in (existing, 200). Lets a password user adopt Google.
+  //   3. Otherwise                       -> create a Google-only account (201).
+  async googleAuth(idToken: string): Promise<GoogleAuthResult> {
+    // Verify FIRST. Bad/expired/forged token never reaches the DB -> 401.
+    const identity = await this.googleVerifier.verify(idToken);
+
+    try {
+      return await this.resolveGoogleAccount(identity);
+    } catch (err) {
+      // Concurrent first-time sign-in race: two requests both passed the
+      // by-sub/by-email reads as "nobody here", then both tried to INSERT. The
+      // second insert hits the unique constraint (email or google_subject_id).
+      // That is NOT a real failure — the row now exists, so retry as a plain
+      // login by sub and hand back tokens. Double-submit -> clean 200, not 500.
+      if (this.isUniqueViolation(err)) {
+        const [bySub] = await this.db
+          .select({ id: account.accountId })
+          .from(account)
+          .where(eq(account.googleSubjectId, identity.sub))
+          .limit(1);
+        if (bySub) {
+          return { tokens: await this.issueTokens(bySub.id), created: false };
+        }
+      }
+      throw err;
+    }
+  }
+
+  // Resolve a verified Google identity to an account by the three rules. Split
+  // out from googleAuth so the public method can wrap it with race-retry.
+  private async resolveGoogleAccount(
+    identity: GoogleIdentity,
+  ): Promise<GoogleAuthResult> {
+    const normalizedEmail = identity.email.toLowerCase();
+
+    // Rule 1: we've seen this Google user before -> straight log in.
+    // (No email_verified re-check: this account was already established.)
+    const [bySub] = await this.db
+      .select({ id: account.accountId })
+      .from(account)
+      .where(eq(account.googleSubjectId, identity.sub))
+      .limit(1);
+    if (bySub) {
+      return { tokens: await this.issueTokens(bySub.id), created: false };
+    }
+
+    // BLOCKER gate: linking (Rule 2) and creating (Rule 3) both attach this
+    // email to an account. An unverified email could belong to someone else, so
+    // refuse before we touch either path.
+    if (!identity.emailVerified) {
+      throw new UnauthorizedException('Google email not verified');
+    }
+
+    // Rule 2: an account already owns this email.
+    const [byEmail] = await this.db
+      .select({
+        id: account.accountId,
+        authProvider: account.authProvider,
+        googleSubjectId: account.googleSubjectId,
+      })
+      .from(account)
+      .where(eq(account.email, normalizedEmail))
+      .limit(1);
+    if (byEmail) {
+      // Only a pure local account with NO sub yet may be linked. If the row is
+      // already 'google'/'both' (or somehow already carries a sub), it is bound
+      // to an immutable Google id. A different incoming sub here means someone
+      // is trying to rebind that identity -> refuse, never silently overwrite.
+      if (byEmail.authProvider !== 'local' || byEmail.googleSubjectId !== null) {
+        throw new UnauthorizedException('Account already linked to Google');
+      }
+
+      // LINK: attach the Google subject and flip provider to 'both' so the user
+      // can sign in either way. Password hash is left untouched.
+      await this.db
+        .update(account)
+        .set({
+          googleSubjectId: identity.sub,
+          authProvider: 'both',
+          updatedAt: new Date(),
+        })
+        .where(eq(account.accountId, byEmail.id));
+
+      // SHOULD 3 audit: deliberate identity-change record (who + what + when).
+      // Only account_id + sub — never the full Google payload. TODO: persist to
+      // a real audit table once one exists.
+      this.logger.log(
+        `audit identity-change: account_id=${byEmail.id} change=google-link google_sub=${identity.sub}`,
+      );
+
+      return { tokens: await this.issueTokens(byEmail.id), created: false };
+    }
+
+    // Rule 3: nobody here yet -> create a fresh Google-only account.
+    // No password hash (Google owns the credential); display name from the
+    // token's name, falling back to the email when Google omits it.
+    const [created] = await this.db
+      .insert(account)
+      .values({
+        email: normalizedEmail,
+        displayName: identity.name || identity.email,
+        passwordHash: null,
+        authProvider: 'google',
+        googleSubjectId: identity.sub,
+      })
+      .returning({ id: account.accountId });
+
+    return { tokens: await this.issueTokens(created.id), created: true };
+  }
+
+  // Is this error a Postgres unique-constraint violation? postgres-js surfaces
+  // the SQLSTATE on err.code. Used to turn an insert race into retry-as-login.
+  private isUniqueViolation(err: unknown): boolean {
+    return (
+      typeof err === 'object' &&
+      err !== null &&
+      (err as { code?: string }).code === PG_UNIQUE_VIOLATION
+    );
   }
 
   // One more wrong try. At the threshold, lock for 15 min.

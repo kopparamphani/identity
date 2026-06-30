@@ -13,6 +13,7 @@ import { Request, Response } from 'express';
 import { AccountLockedException, AuthService, IssuedTokens } from './auth.service';
 import { LoginDto } from './dto/login.dto';
 import { SignupDto } from './dto/signup.dto';
+import { GoogleAuthDto } from './dto/google-auth.dto';
 
 // Cookie name for the opaque refresh token (web clients).
 const REFRESH_COOKIE = 'refresh_token';
@@ -53,6 +54,20 @@ export class AuthController {
       }
       throw err;
     }
+  }
+
+  // POST /auth/google -> ID-token flow (REQ-ACC-01/02 Google paths).
+  // Status is DYNAMIC: brand-new Google account -> 201, existing/linked -> 200.
+  // We set it ourselves on res, so no @HttpCode here. 401 on a bad token.
+  // NOTE: not in OpenAPI yet (see report).
+  @Post('google')
+  async google(
+    @Body() dto: GoogleAuthDto,
+    @Res({ passthrough: true }) res: Response,
+  ): Promise<TokenResponseBody> {
+    const result = await this.auth.googleAuth(dto.id_token);
+    res.status(result.created ? HttpStatus.CREATED : HttpStatus.OK);
+    return this.deliver(result.tokens, res);
   }
 
   // POST /auth/logout -> 204. Revoke the session behind the cookie.
