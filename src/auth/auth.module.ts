@@ -3,12 +3,13 @@ import { JwtModule } from '@nestjs/jwt';
 import { AuthController } from './auth.controller';
 import { AuthService } from './auth.service';
 import { PasswordService } from './password.service';
+import { GoogleVerifierService } from './google-verifier.service';
 
 // Wires the auth endpoints. Secret is passed per-sign call from env (ConfigService),
 // so JwtModule here just provides the service.
 @Module({
   imports: [JwtModule.register({})],
   controllers: [AuthController],
-  providers: [AuthService, PasswordService],
+  providers: [AuthService, PasswordService, GoogleVerifierService],
 })
 export class AuthModule {}
