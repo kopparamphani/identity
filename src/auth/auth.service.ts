@@ -9,11 +9,12 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
-import { and, eq } from 'drizzle-orm';
+import { and, eq, gt, isNull, sql } from 'drizzle-orm';
 import { createHash, randomBytes } from 'crypto';
 import { DRIZZLE, DrizzleDB } from '../db/db.module';
-import { account, session } from '../db/schema';
+import { account, passwordReset, session } from '../db/schema';
 import { PasswordService } from './password.service';
+import { EmailService } from './email.service';
 import {
   GoogleIdentity,
   GoogleVerifierService,
@@ -29,6 +30,12 @@ const REFRESH_TTL_DAYS = 30;
 
 // Entropy of the opaque refresh token. 32 random bytes -> ~256 bits, base64url.
 const REFRESH_TOKEN_BYTES = 32;
+
+// Entropy of the reset token. Same 32 bytes -> ~256 bits, base64url. Unguessable.
+const RESET_TOKEN_BYTES = 32;
+
+// Reset-link life: 1 hour, one-time use (LOCKED in NFR / data model).
+const RESET_TTL_MS = 60 * 60 * 1000;
 
 // Postgres unique-violation SQLSTATE. Thrown when two concurrent first-time
 // Google sign-ins both try to insert the same email/sub. We catch this to turn
@@ -47,6 +54,10 @@ export interface IssuedTokens {
 
 // Thrown when a locked account tries to log in -> controller maps to 429.
 export class AccountLockedException extends Error {}
+
+// Thrown when a reset ticket is missing / already used / expired. Controller
+// maps it to a GENERIC 400 — we never reveal which of the three it was.
+export class InvalidResetTokenException extends Error {}
 
 // Google result = the usual tokens + whether we minted a brand-new account.
 // created -> 201, existing -> 200 (controller picks the status from this flag).
@@ -72,6 +83,7 @@ export class AuthService implements OnModuleInit {
     private readonly jwt: JwtService,
     private readonly config: ConfigService,
     private readonly googleVerifier: GoogleVerifierService,
+    private readonly email: EmailService,
   ) {}
 
   // Precompute the dummy hash once when the module boots, not per-request.
@@ -288,6 +300,165 @@ export class AuthService implements OnModuleInit {
     return { tokens: await this.issueTokens(created.id), created: true };
   }
 
+  // PASSWORD RESET — REQUEST (REQ-ACC-03). Caller ALWAYS gets a generic 202;
+  // this method NEVER tells anyone whether the email exists (no enumeration).
+  //   - Local-capable account (has a password_hash, i.e. provider local/both):
+  //     mint a high-entropy one-time token, store only its sha256 with a 1-hour
+  //     expiry, email the reset link with the RAW token.
+  //   - Google-only account (no password_hash) or unknown email: no-op, no mail.
+  // Either way the controller returns the same 202 message.
+  async requestPasswordReset(email: string): Promise<void> {
+    const normalizedEmail = email.toLowerCase();
+
+    const [found] = await this.db
+      .select({
+        id: account.accountId,
+        email: account.email,
+        passwordHash: account.passwordHash,
+      })
+      .from(account)
+      .where(eq(account.email, normalizedEmail))
+      .limit(1);
+
+    // No local password to reset (unknown, or Google-only) -> silently stop.
+    // No mail, no leak. The caller still sees the same generic 202.
+    if (!found || !found.passwordHash) {
+      return;
+    }
+
+    // TIMING: don't await token-insert + SMTP in the request path. If a real
+    // account did that work while unknown/Google-only emails returned instantly,
+    // the response time itself would leak "this account exists" — defeating the
+    // whole no-enumeration promise. So kick it off and DON'T block the 202.
+    // Like: drop the letter in the mailbox and walk away; don't wait for the
+    // mail truck. Errors are logged, never surfaced (still a generic 202).
+    void this.createAndSendResetLink(found.id, found.email);
+  }
+
+  // Off the response path (see requestPasswordReset). Mint a one-time token,
+  // store only its hash, email the RAW token link. Swallow+log any failure so a
+  // dead SMTP or DB hiccup can't crash the request or leak via a 500.
+  private async createAndSendResetLink(
+    accountId: string,
+    toEmail: string,
+  ): Promise<void> {
+    try {
+      // Raw token goes in the email link; only its hash is ever stored.
+      const rawToken = this.generateResetToken();
+      const expiresAt = new Date(Date.now() + RESET_TTL_MS);
+
+      await this.db.insert(passwordReset).values({
+        accountId,
+        tokenHash: this.hashToken(rawToken),
+        expiresAt,
+      });
+
+      // Link the web app opens to set a new password. Base URL is deploy config.
+      const baseUrl = this.config.getOrThrow<string>('APP_BASE_URL');
+      const resetUrl = `${baseUrl}/reset?token=${rawToken}`;
+      await this.email.sendPasswordReset(toEmail, resetUrl);
+    } catch (err) {
+      // Fire-and-forget: a failed send must NOT bubble (no unhandled rejection,
+      // no crash, no info leak). Log for ops; the caller already got its 202.
+      this.logger.error(
+        `password-reset send failed for account_id=${accountId}: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  }
+
+  // PASSWORD RESET — CONFIRM (REQ-ACC-03). Consume a reset ticket and set a new
+  // password. Generic failures only — never reveal WHY a bad link failed.
+  //   - Look up BY sha256(token). Missing / already used / expired -> 400.
+  //   - Enforce password policy (length + breach), reusing PasswordService -> 422.
+  //   - Set new Argon2id hash, stamp the ticket used (one-time), revoke ALL
+  //     sessions for the account (force re-login everywhere) -> 200.
+  // Thrown: InvalidResetTokenException (controller -> 400),
+  //         UnprocessableEntityException (controller -> 422).
+  async confirmPasswordReset(token: string, newPassword: string): Promise<void> {
+    const tokenHash = this.hashToken(token);
+
+    // BLOCKER FIX — atomic one-time consume. The OLD code did select-then-check-
+    // then-update: two concurrent confirms with the SAME token could both pass
+    // the check before either stamped used_at, so BOTH succeeded (race). Now the
+    // CONSUME itself is the gate: one conditional UPDATE stamps used_at ONLY if
+    // the ticket is still unused AND unexpired. Postgres serializes the row
+    // write, so exactly ONE update wins (1 row); the loser matches 0 rows.
+    // Like: one turnstile — first person through locks it behind them.
+    const [winner] = await this.db
+      .update(passwordReset)
+      .set({ usedAt: new Date() })
+      .where(
+        and(
+          eq(passwordReset.tokenHash, tokenHash),
+          isNull(passwordReset.usedAt),
+          gt(passwordReset.expiresAt, sql`now()`),
+        ),
+      )
+      .returning({ accountId: passwordReset.accountId });
+
+    // 0 rows -> not found, already spent, or expired. One generic error; we
+    // deliberately don't say which, so an attacker can't probe tickets.
+    if (!winner) {
+      throw new InvalidResetTokenException('Invalid or expired reset link');
+    }
+
+    const accountId = winner.accountId;
+
+    // NOTE: the ticket is now spent even if the password check below fails (422).
+    // That's the safe trade: a one-time link is truly one-time. A user who typed
+    // a weak password just requests a fresh link. Better than leaving a live
+    // ticket after we've already committed to consuming it in the race gate.
+
+    // Same policy gate as signup: length first (cheap), then breach -> 422.
+    const policy = await this.passwords.checkPolicy(newPassword);
+    if (!policy.ok) {
+      throw new UnprocessableEntityException(
+        policy.reason === 'too_short'
+          ? 'Password must be at least 8 characters'
+          : 'Password is known to be breached; pick another',
+      );
+    }
+
+    const passwordHash = await this.passwords.hash(newPassword);
+
+    // Set the new password. Leave auth_provider alone: a 'both' account keeps
+    // Google linked; a 'local' account stays local.
+    await this.db
+      .update(account)
+      .set({
+        passwordHash,
+        // A successful reset is also a way back in -> clear any lockout memory.
+        failedLoginAttempts: 0,
+        lockedUntil: null,
+        updatedAt: new Date(),
+      })
+      .where(eq(account.accountId, accountId));
+
+    // SHOULD 2 — kill sibling tickets. A password change should invalidate EVERY
+    // other outstanding reset link for this account (e.g. an old email the user
+    // never used). Stamp all still-unused tickets spent. We already consumed the
+    // winner above, so exclude it. now() would also work but explicit is clearer.
+    await this.db
+      .update(passwordReset)
+      .set({ usedAt: new Date() })
+      .where(
+        and(
+          eq(passwordReset.accountId, accountId),
+          isNull(passwordReset.usedAt),
+        ),
+      );
+
+    // SECURITY: a reset means "I (re)claim this account" -> kill every live
+    // session so any thief who had one is logged out everywhere. Reuses the
+    // same revoke flag logout/refresh honor.
+    await this.db
+      .update(session)
+      .set({ revoked: true })
+      .where(eq(session.accountId, accountId));
+  }
+
   // Is this error a Postgres unique-constraint violation? postgres-js surfaces
   // the SQLSTATE on err.code. Used to turn an insert race into retry-as-login.
   private isUniqueViolation(err: unknown): boolean {
@@ -390,6 +561,11 @@ export class AuthService implements OnModuleInit {
   // High-entropy opaque token the client holds. base64url so it's cookie-safe.
   private generateRefreshToken(): string {
     return randomBytes(REFRESH_TOKEN_BYTES).toString('base64url');
+  }
+
+  // High-entropy reset token for the email link. base64url so it's URL-safe.
+  private generateResetToken(): string {
+    return randomBytes(RESET_TOKEN_BYTES).toString('base64url');
   }
 
   // sha256(token) hex — what we store + look up by. One-way: a DB leak can't

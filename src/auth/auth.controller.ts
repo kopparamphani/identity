@@ -10,10 +10,22 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Request, Response } from 'express';
-import { AccountLockedException, AuthService, IssuedTokens } from './auth.service';
+import {
+  AccountLockedException,
+  AuthService,
+  InvalidResetTokenException,
+  IssuedTokens,
+} from './auth.service';
 import { LoginDto } from './dto/login.dto';
 import { SignupDto } from './dto/signup.dto';
 import { GoogleAuthDto } from './dto/google-auth.dto';
+import { PasswordResetRequestDto } from './dto/password-reset-request.dto';
+import { PasswordResetConfirmDto } from './dto/password-reset-confirm.dto';
+
+// One generic line for reset requests. Same text whether the email exists or
+// not -> never leaks who has an account (REQ-ACC-03 locked behavior).
+const RESET_REQUEST_MESSAGE =
+  'If an account exists, a reset link was sent';
 
 // Cookie name for the opaque refresh token (web clients).
 const REFRESH_COOKIE = 'refresh_token';
@@ -93,6 +105,40 @@ export class AuthController {
     const token = this.readRefreshCookie(req);
     const tokens = await this.auth.refresh(token);
     return this.deliver(tokens, res);
+  }
+
+  // POST /auth/password-reset/request -> ALWAYS 202 + generic message.
+  // We never reveal whether the email exists. If a local-capable account is
+  // there, the service emails a one-time link; otherwise it quietly no-ops.
+  // NOTE: not in OpenAPI yet (docs adds it — see report).
+  @Post('password-reset/request')
+  @HttpCode(HttpStatus.ACCEPTED)
+  async passwordResetRequest(
+    @Body() dto: PasswordResetRequestDto,
+  ): Promise<{ message: string }> {
+    await this.auth.requestPasswordReset(dto.email);
+    return { message: RESET_REQUEST_MESSAGE };
+  }
+
+  // POST /auth/password-reset/confirm -> 200 on success.
+  // 400 generic on missing/used/expired token; 422 on weak/breached password.
+  // On success: new password set, token spent, ALL sessions revoked.
+  // NOTE: not in OpenAPI yet (docs adds it — see report).
+  @Post('password-reset/confirm')
+  @HttpCode(HttpStatus.OK)
+  async passwordResetConfirm(
+    @Body() dto: PasswordResetConfirmDto,
+  ): Promise<{ message: string }> {
+    try {
+      await this.auth.confirmPasswordReset(dto.token, dto.new_password);
+      return { message: 'Password updated' };
+    } catch (err) {
+      // Bad/used/expired ticket -> generic 400. Don't say which.
+      if (err instanceof InvalidResetTokenException) {
+        throw new HttpException(err.message, HttpStatus.BAD_REQUEST);
+      }
+      throw err; // 422 (weak/breached) bubbles up unchanged.
+    }
   }
 
   // Put the refresh token in an httpOnly Secure cookie; return only the access

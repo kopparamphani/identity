@@ -9,5 +9,6 @@
   "globalSetup": "<rootDir>/support/global-setup.ts",
   "globalTeardown": "<rootDir>/support/global-teardown.ts",
   "testTimeout": 30000,
-  "forceExit": true
+  "forceExit": true,
+  "maxWorkers": 1
 }

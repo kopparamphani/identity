@@ -48,9 +48,12 @@ export async function bootTestApp(customize?: ModuleCustomizer): Promise<{
   return { app, db };
 }
 
-// Wipe both tables so each test starts clean. CASCADE handles the session FK.
+// Wipe all tables so each test starts clean. CASCADE handles the FKs
+// (session + password_reset both point at account).
 // Like: clear the whiteboard before the next test writes on it.
 export async function resetTables(db: DrizzleDB): Promise<void> {
   // Raw SQL truncate is fastest + guarantees zero rows + resets nothing we need.
-  await db.execute(sql`TRUNCATE TABLE "session", "account" CASCADE`);
+  await db.execute(
+    sql`TRUNCATE TABLE "password_reset", "session", "account" CASCADE`,
+  );
 }
