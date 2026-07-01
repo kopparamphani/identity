@@ -17,6 +17,9 @@ export default function globalSetup(): void {
   // Google verification is stubbed in the Google e2e (no live credentials).
   process.env.GOOGLE_CLIENT_ID =
     process.env.GOOGLE_CLIENT_ID ?? 'test-google-client-id.apps.googleusercontent.com';
+  // Reset flow (1c) builds the link from this. EmailService is stubbed in tests,
+  // but AuthService.requestPasswordReset getOrThrow's APP_BASE_URL. Fixed value.
+  process.env.APP_BASE_URL = process.env.APP_BASE_URL ?? 'http://localhost:5173';
 
   // Stash for teardown (separate Node process can't see in-memory state otherwise,
   // but env carved here is enough since teardown re-derives the name).
