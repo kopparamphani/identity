@@ -1,0 +1,69 @@
+# Mailpit = local catch-all mailbox for dev (open-source, axllent/mailpit).
+# WHY: the password-reset flow (1c) actually SENDS an email via SMTP. Locally we
+# don't want to hit a real mail server, so Mailpit swallows every message and
+# shows it in a little web UI / API. Like: a fake post office that keeps every
+# letter so you can read it.
+#
+# ONLY for the local kind cluster. Prod points SMTP at a real relay (secret).
+# Image is kind-loaded on the host (Zscaler blocks in-cluster pulls) ->
+# imagePullPolicy IfNotPresent so the node uses the loaded copy.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mailpit
+  namespace: splitwise
+  labels:
+    app.kubernetes.io/name: mailpit
+    app.kubernetes.io/part-of: splitwise
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mailpit
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mailpit
+        app.kubernetes.io/part-of: splitwise
+    spec:
+      containers:
+        - name: mailpit
+          image: axllent/mailpit:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            # 1025 = SMTP the app talks to. 8025 = web UI + JSON API.
+            - name: smtp
+              containerPort: 1025
+            - name: http
+              containerPort: 8025
+          # Small asks; it's a dev tool holding a handful of test mails.
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 128Mi
+---
+# Service = stable in-cluster address. App uses host "mailpit" port 1025 (SMTP);
+# testers port-forward 8025 to read the caught mail.
+apiVersion: v1
+kind: Service
+metadata:
+  name: mailpit
+  namespace: splitwise
+  labels:
+    app.kubernetes.io/name: mailpit
+    app.kubernetes.io/part-of: splitwise
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: mailpit
+  ports:
+    - name: smtp
+      port: 1025
+      targetPort: 1025
+    - name: http
+      port: 8025
+      targetPort: 8025

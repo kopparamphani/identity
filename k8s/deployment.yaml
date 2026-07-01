@@ -84,6 +84,39 @@ spec:
                 secretKeyRef:
                   name: identity-secrets
                   key: JWT_SECRET
+            # Google sign-in (1b). App reads this at boot with getOrThrow
+            # (google-verifier.service.ts) -> MISSING = pod won't start.
+            # Dummy locally; real client id is a deploy secret.
+            - name: GOOGLE_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: identity-secrets
+                  key: GOOGLE_CLIENT_ID
+            # Password-reset email (1c). SMTP_HOST is getOrThrow in the send
+            # path (email.service.ts); the rest shape the message + link.
+            # Local = Mailpit catch-all inbox. Prod = real SMTP via secret.
+            - name: SMTP_HOST
+              valueFrom:
+                secretKeyRef:
+                  name: identity-secrets
+                  key: SMTP_HOST
+            - name: SMTP_PORT
+              valueFrom:
+                secretKeyRef:
+                  name: identity-secrets
+                  key: SMTP_PORT
+            - name: SMTP_FROM
+              valueFrom:
+                secretKeyRef:
+                  name: identity-secrets
+                  key: SMTP_FROM
+            # Base URL baked into the reset link (auth.service.ts getOrThrow).
+            # Must match where the user opens the app. Local = the port-forward.
+            - name: APP_BASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: identity-secrets
+                  key: APP_BASE_URL
           # Liveness = "is it alive?". Fail -> K8s restarts the pod.
           livenessProbe:
             httpGet:

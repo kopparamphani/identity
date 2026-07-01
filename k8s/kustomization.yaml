@@ -12,6 +12,9 @@ resources:
   - deployment.yaml
   - service.yaml
   - ingress.yaml
+  # Local dev only: catch-all mailbox so the password-reset email lands
+  # somewhere we can read. Prod overlay drops this (real SMTP relay).
+  - mailpit.yaml
 # NOTE: secret.example.yaml is intentionally NOT listed — it is a template only.
 # The real identity-secrets Secret is created out of band (kind) or sealed (prod).
 
